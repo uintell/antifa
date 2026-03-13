@@ -2,6 +2,8 @@
 
 Antifa is a desktop Tor messenger written in Rust with `eframe/egui` for the UI and Arti for the Tor transport layer.
 
+Website: https://uintell.org
+
 Each running instance boots Tor, publishes its own `.onion` address, and can open a direct session with another instance by connecting to that peer's `.onion`.
 
 ## What it does
