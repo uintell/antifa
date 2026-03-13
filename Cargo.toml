@@ -9,6 +9,7 @@ arti-client = { version = "0.22", features = ["keymgr", "onion-service-client", 
 bincode = "1"
 egui = "0.28"
 futures-util = "0.3"
+png = "0.18"
 rand = "0.8"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }

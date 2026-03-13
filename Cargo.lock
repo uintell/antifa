@@ -150,6 +150,7 @@ dependencies = [
  "eframe",
  "egui",
  "futures-util",
+ "png",
  "rand",
  "ring",
  "serde",

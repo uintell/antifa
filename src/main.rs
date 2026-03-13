@@ -4,6 +4,7 @@ mod app;
 mod messaging;
 mod p2p;
 mod tor;
+mod video;
 
 fn main() -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions::default();

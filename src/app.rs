@@ -1,6 +1,7 @@
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use anyhow::Context;
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 
 use crate::messaging::{ChatMessage, Peer};
@@ -25,11 +26,16 @@ pub struct MessengerApp {
     onion_address: String,
     tor_status: String,
     connection: ConnectionState,
+    video_active: bool,
+    video_status: String,
     friend_address: String,
     friend_alias: String,
     message_input: String,
     chat: Conversation,
     status_feed: Vec<String>,
+    pending_remote_video: Option<Vec<u8>>,
+    remote_video_texture: Option<egui::TextureHandle>,
+    remote_video_size: Option<[usize; 2]>,
     tor_rx: Receiver<TorEvent>,
     p2p_rx: Receiver<p2p::P2pEvent>,
     p2p_handle: p2p::Handle,
@@ -55,6 +61,8 @@ impl MessengerApp {
             onion_address: String::new(),
             tor_status: "Bootstrapping Tor network...".to_owned(),
             connection: ConnectionState::Disconnected,
+            video_active: false,
+            video_status: "Video idle".to_owned(),
             friend_address: String::new(),
             friend_alias: "Direct Session".to_owned(),
             message_input: String::new(),
@@ -66,6 +74,9 @@ impl MessengerApp {
                 )],
             },
             status_feed: vec!["App launched".into()],
+            pending_remote_video: None,
+            remote_video_texture: None,
+            remote_video_size: None,
             tor_rx,
             p2p_rx,
             p2p_handle,
@@ -127,6 +138,19 @@ impl MessengerApp {
                         timestamp: crate::messaging::now(),
                     });
                 }
+                p2p::P2pEvent::VideoFrame { from, png } => {
+                    if self.friend_address.trim().is_empty() {
+                        self.friend_address = from.clone();
+                    }
+                    self.chat.onion = from.clone();
+                    self.connection = ConnectionState::Connected(from.clone());
+                    self.video_status = format!("Receiving experimental video from {from}");
+                    self.pending_remote_video = Some(png);
+                }
+                p2p::P2pEvent::VideoState { active, label } => {
+                    self.video_active = active;
+                    self.video_status = label;
+                }
             }
         }
     }
@@ -146,6 +170,54 @@ impl MessengerApp {
         self.p2p_handle
             .send_text(self.friend_address.clone(), body.clone());
         self.message_input.clear();
+    }
+
+    fn toggle_video(&mut self) {
+        if self.video_active {
+            self.p2p_handle.stop_video();
+            self.video_active = false;
+            self.video_status = "Video stopped".to_owned();
+            return;
+        }
+
+        if self.friend_address.trim().is_empty() {
+            self.chat.messages.push(ChatMessage::system(
+                "Enter a friend's .onion before starting video.",
+            ));
+            return;
+        }
+
+        self.video_active = true;
+        self.video_status = format!(
+            "Starting experimental video to {}",
+            self.friend_address.trim()
+        );
+        self.p2p_handle.start_video(self.friend_address.clone());
+    }
+
+    fn refresh_remote_video_texture(&mut self, ctx: &egui::Context) {
+        let Some(png) = self.pending_remote_video.take() else {
+            return;
+        };
+
+        match decode_png_frame(&png) {
+            Ok((image, size)) => {
+                self.remote_video_size = Some(size);
+                if let Some(texture) = self.remote_video_texture.as_mut() {
+                    texture.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.remote_video_texture = Some(ctx.load_texture(
+                        "remote-video",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+            Err(err) => {
+                self.status_feed
+                    .push(format!("Video decode failed: {err}"));
+            }
+        }
     }
 
     fn connection_label(&self) -> String {
@@ -170,6 +242,7 @@ impl eframe::App for MessengerApp {
         ctx.request_repaint_after(Duration::from_millis(100));
         self.poll_tor_events();
         self.poll_p2p_events();
+        self.refresh_remote_video_texture(ctx);
 
         egui::TopBottomPanel::top("top_bar")
             .frame(egui::Frame::none().fill(Color32::from_rgb(16, 18, 23)))
@@ -237,6 +310,28 @@ impl eframe::App for MessengerApp {
                     }
 
                     ui.separator();
+                    ui.heading(RichText::new("Video").color(Color32::WHITE));
+                    ui.label(
+                        RichText::new("Experimental over Tor; expect low frame rate")
+                            .color(Color32::from_gray(190)),
+                    );
+                    let video_button = if self.video_active {
+                        "Stop Video"
+                    } else {
+                        "Start Video"
+                    };
+                    if ui
+                        .add_sized(
+                            Vec2::new(ui.available_width(), 32.0),
+                            egui::Button::new(video_button),
+                        )
+                        .clicked()
+                    {
+                        self.toggle_video();
+                    }
+                    ui.label(RichText::new(&self.video_status).color(Color32::from_gray(200)));
+
+                    ui.separator();
                     ui.heading(RichText::new("Status").color(Color32::WHITE));
                     egui::ScrollArea::vertical()
                         .max_height(160.0)
@@ -264,6 +359,16 @@ impl eframe::App for MessengerApp {
                         }
                     });
                     ui.add_space(8.0);
+
+                    if self.video_active || self.remote_video_texture.is_some() {
+                        render_video_panel(
+                            ui,
+                            self.remote_video_texture.as_ref(),
+                            self.remote_video_size,
+                            &self.video_status,
+                        );
+                        ui.add_space(10.0);
+                    }
 
                     let composer_height = 44.0;
                     let spacing = ui.spacing().item_spacing.y * 2.0 + 6.0;
@@ -312,6 +417,81 @@ fn chip(title: &str, text: &str, color: Color32) -> RichText {
     RichText::new(format!("{title}: {text}"))
         .color(color)
         .strong()
+}
+
+fn decode_png_frame(png_bytes: &[u8]) -> anyhow::Result<(egui::ColorImage, [usize; 2])> {
+    let cursor = std::io::Cursor::new(png_bytes);
+    let mut decoder = png::Decoder::new(cursor);
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+
+    let mut reader = decoder.read_info().context("read PNG metadata")?;
+    let mut buffer = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or_else(|| anyhow::anyhow!("PNG frame output buffer size unavailable"))?
+    ];
+    let info = reader
+        .next_frame(&mut buffer)
+        .context("decode PNG frame payload")?;
+    let size = [info.width as usize, info.height as usize];
+    let pixels = &buffer[..info.buffer_size()];
+
+    let image = match info.color_type {
+        png::ColorType::Rgba => egui::ColorImage::from_rgba_unmultiplied(size, pixels),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(size[0] * size[1] * 4);
+            for chunk in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            egui::ColorImage::from_rgba_unmultiplied(size, &rgba)
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported PNG color type for video frame: {other:?}"
+            ));
+        }
+    };
+
+    Ok((image, size))
+}
+
+fn render_video_panel(
+    ui: &mut egui::Ui,
+    texture: Option<&egui::TextureHandle>,
+    size: Option<[usize; 2]>,
+    status: &str,
+) {
+    ui.heading(RichText::new("Video").color(Color32::WHITE));
+    egui::Frame::none()
+        .fill(Color32::from_rgb(18, 20, 28))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(35, 40, 50)))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::same(12.0))
+        .show(ui, |ui| {
+            let aspect = size
+                .map(|[width, height]| width as f32 / height.max(1) as f32)
+                .unwrap_or(4.0 / 3.0);
+            let width = ui.available_width().min(420.0);
+            let height = (width / aspect).clamp(180.0, 320.0);
+            let frame_size = Vec2::new(width, height);
+
+            if let Some(texture) = texture {
+                ui.image((texture.id(), frame_size));
+            } else {
+                ui.allocate_ui_with_layout(
+                    frame_size,
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.add_space((frame_size.y - 24.0).max(0.0) * 0.5);
+                        ui.label(RichText::new("No remote video yet").color(Color32::from_gray(210)));
+                    },
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(status).color(Color32::from_gray(190)));
+        });
 }
 
 fn render_message(ui: &mut egui::Ui, message: &ChatMessage) {

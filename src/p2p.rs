@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::sync::mpsc::Sender;
+use std::sync::{mpsc::Sender, Arc};
 
 use anyhow::{anyhow, Context};
 use arti_client::{
@@ -15,6 +15,7 @@ use tor_proto::stream::IncomingStreamRequest;
 use tor_rtcompat::Runtime;
 
 use crate::tor::TorEvent;
+use crate::video;
 
 #[derive(Clone, Debug)]
 pub enum P2pEvent {
@@ -22,6 +23,8 @@ pub enum P2pEvent {
     PeerConnected(String),
     Info(String),
     Incoming { from: String, body: String },
+    VideoFrame { from: String, png: Vec<u8> },
+    VideoState { active: bool, label: String },
 }
 
 #[derive(Clone)]
@@ -33,17 +36,27 @@ pub struct Handle {
 enum P2pCommand {
     Connect(String),
     Send { to: String, body: String },
+    StartVideo(String),
+    StopVideo,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WireMessage {
     from: String,
-    body: String,
+    payload: WirePayload,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum WirePayload {
+    Handshake,
+    Text(String),
+    VideoFrame { png: Vec<u8> },
 }
 
 const HANDSHAKE_BODY: &str = "__antifa_handshake__";
 const SERVICE_NICKNAME: &str = "antifa-messenger";
 const SERVICE_PORT: u16 = 17600;
+const MAX_WIRE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
 impl Handle {
     pub fn connect(&self, peer: String) {
@@ -52,6 +65,14 @@ impl Handle {
 
     pub fn send_text(&self, to: String, body: String) {
         let _ = self.tx.send(P2pCommand::Send { to, body });
+    }
+
+    pub fn start_video(&self, to: String) {
+        let _ = self.tx.send(P2pCommand::StartVideo(to));
+    }
+
+    pub fn stop_video(&self) {
+        let _ = self.tx.send(P2pCommand::StopVideo);
     }
 }
 
@@ -66,6 +87,10 @@ pub fn spawn(
         if let Err(err) = run_transport(event_tx.clone(), tor_tx.clone(), &mut cmd_rx).await {
             let _ = tor_tx.send(TorEvent::Status(format!("Tor failed: {err:#}")));
             let _ = event_tx.send(P2pEvent::Info(format!("Transport error: {err:#}")));
+            let _ = event_tx.send(P2pEvent::VideoState {
+                active: false,
+                label: "Video unavailable".to_owned(),
+            });
             let _ = event_tx.send(P2pEvent::Status(super::app::ConnectionState::Disconnected));
         }
     });
@@ -78,12 +103,14 @@ async fn run_transport(
     tor_tx: Sender<TorEvent>,
     cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<P2pCommand>,
 ) -> anyhow::Result<()> {
-    let tor_client = TorClient::builder()
-        .config(TorClientConfig::default())
-        .bootstrap_behavior(BootstrapBehavior::Manual)
-        .create_unbootstrapped_async()
-        .await
-        .context("create Tor client")?;
+    let tor_client = Arc::new(
+        TorClient::builder()
+            .config(TorClientConfig::default())
+            .bootstrap_behavior(BootstrapBehavior::Manual)
+            .create_unbootstrapped_async()
+            .await
+            .context("create Tor client")?,
+    );
 
     let mut bootstrap_events = tor_client.bootstrap_events();
     let bootstrap_tor_tx = tor_tx.clone();
@@ -132,6 +159,10 @@ async fn run_transport(
     let _ = event_tx.send(P2pEvent::Info(format!(
         "Hidden service configured on {local_onion} (port {SERVICE_PORT})"
     )));
+    let _ = event_tx.send(P2pEvent::VideoState {
+        active: false,
+        label: "Video idle".to_owned(),
+    });
 
     let mut service_events = service.status_events();
     let service_tor_tx = tor_tx.clone();
@@ -152,7 +183,8 @@ async fn run_transport(
         while let Some(stream_request) = stream_requests.next().await {
             let incoming_event_tx = incoming_event_tx.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_stream_request(stream_request, incoming_event_tx.clone()).await
+                if let Err(err) =
+                    handle_stream_request(stream_request, incoming_event_tx.clone()).await
                 {
                     let _ = incoming_event_tx
                         .send(P2pEvent::Info(format!("Incoming connection failed: {err:#}")));
@@ -164,6 +196,7 @@ async fn run_transport(
     let _ = event_tx.send(P2pEvent::Status(super::app::ConnectionState::Disconnected));
 
     let _service = service;
+    let mut video_task: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -180,7 +213,14 @@ async fn run_transport(
                     peer.clone(),
                 )));
 
-                match send_message(&tor_client, &peer, &local_onion, HANDSHAKE_BODY).await {
+                match send_payload(
+                    tor_client.as_ref(),
+                    &peer,
+                    &local_onion,
+                    WirePayload::Handshake,
+                )
+                .await
+                {
                     Ok(()) => {
                         let _ = event_tx.send(P2pEvent::Status(
                             super::app::ConnectionState::Connected(peer),
@@ -204,7 +244,14 @@ async fn run_transport(
                     continue;
                 }
 
-                match send_message(&tor_client, &peer, &local_onion, &body).await {
+                match send_payload(
+                    tor_client.as_ref(),
+                    &peer,
+                    &local_onion,
+                    WirePayload::Text(body),
+                )
+                .await
+                {
                     Ok(()) => {
                         let _ = event_tx.send(P2pEvent::Status(
                             super::app::ConnectionState::Connected(peer),
@@ -217,9 +264,58 @@ async fn run_transport(
                     }
                 }
             }
+            P2pCommand::StartVideo(peer) => {
+                let peer = normalize_onion(&peer);
+                if peer.is_empty() {
+                    let _ = event_tx.send(P2pEvent::Info(
+                        "Enter a peer .onion address before starting video.".to_owned(),
+                    ));
+                    continue;
+                }
+
+                if let Some(task) = video_task.take() {
+                    task.abort();
+                }
+
+                let _ = event_tx.send(P2pEvent::VideoState {
+                    active: true,
+                    label: format!("Starting experimental video stream to {peer}"),
+                });
+
+                let video_client = tor_client.clone();
+                let video_peer = peer.clone();
+                let video_from = local_onion.clone();
+                let video_events = event_tx.clone();
+                video_task = Some(tokio::spawn(async move {
+                    if let Err(err) =
+                        run_video_sender(video_client, video_peer.clone(), video_from, video_events.clone())
+                            .await
+                    {
+                        let _ = video_events.send(P2pEvent::Info(format!(
+                            "Video stream error for {video_peer}: {err:#}"
+                        )));
+                    }
+                    let _ = video_events.send(P2pEvent::VideoState {
+                        active: false,
+                        label: "Video idle".to_owned(),
+                    });
+                }));
+            }
+            P2pCommand::StopVideo => {
+                if let Some(task) = video_task.take() {
+                    task.abort();
+                }
+                let _ = event_tx.send(P2pEvent::VideoState {
+                    active: false,
+                    label: "Video stopped".to_owned(),
+                });
+            }
         }
     }
 
+    if let Some(task) = video_task.take() {
+        task.abort();
+    }
     let _ = tor_tx.send(TorEvent::Status("Onion service stopped".to_owned()));
     Ok(())
 }
@@ -249,22 +345,76 @@ async fn handle_stream_request(
         };
 
         let from = normalize_onion(&message.from);
-        if message.body == HANDSHAKE_BODY {
-            let _ = event_tx.send(P2pEvent::PeerConnected(from));
-        } else {
-            let _ = event_tx.send(P2pEvent::Incoming {
-                from,
-                body: message.body,
-            });
+        match message.payload {
+            WirePayload::Handshake => {
+                let _ = event_tx.send(P2pEvent::PeerConnected(from));
+            }
+            WirePayload::Text(body) => {
+                let body = if body == HANDSHAKE_BODY {
+                    String::new()
+                } else {
+                    body
+                };
+
+                if body.is_empty() {
+                    let _ = event_tx.send(P2pEvent::PeerConnected(from));
+                } else {
+                    let _ = event_tx.send(P2pEvent::Incoming { from, body });
+                }
+            }
+            WirePayload::VideoFrame { png } => {
+                let _ = event_tx.send(P2pEvent::VideoFrame { from, png });
+            }
         }
     }
 }
 
-async fn send_message<R: Runtime>(
+async fn run_video_sender<R: Runtime>(
+    tor_client: Arc<TorClient<R>>,
+    target_onion: String,
+    from_onion: String,
+    event_tx: Sender<P2pEvent>,
+) -> anyhow::Result<()> {
+    let mut prefs = StreamPrefs::new();
+    prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
+
+    let mut stream = tor_client
+        .connect_with_prefs((target_onion.as_str(), SERVICE_PORT), &prefs)
+        .await
+        .with_context(|| format!("connect to {target_onion}:{SERVICE_PORT} for video over Tor"))?;
+
+    let _ = event_tx.send(P2pEvent::Info(format!(
+        "Video stream open to {target_onion}; expect high latency over Tor"
+    )));
+
+    let mut child = video::spawn_capture_process()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg capture process did not provide stdout"))?;
+
+    while let Some(png) = video::read_png_frame(&mut stdout).await? {
+        let message = WireMessage {
+            from: normalize_onion(&from_onion),
+            payload: WirePayload::VideoFrame { png },
+        };
+        write_wire_message(&mut stream, &message).await?;
+        stream.flush().await.context("flush Tor video stream")?;
+    }
+
+    let status = child.wait().await.context("wait for ffmpeg capture process")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("ffmpeg capture process exited with status {status}"))
+    }
+}
+
+async fn send_payload<R: Runtime>(
     tor_client: &TorClient<R>,
     target_onion: &str,
     from_onion: &str,
-    body: &str,
+    payload: WirePayload,
 ) -> anyhow::Result<()> {
     let mut prefs = StreamPrefs::new();
     prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
@@ -276,7 +426,7 @@ async fn send_message<R: Runtime>(
 
     let message = WireMessage {
         from: normalize_onion(from_onion),
-        body: body.to_owned(),
+        payload,
     };
     write_wire_message(&mut stream, &message).await?;
     stream.flush().await.context("flush Tor stream")?;
@@ -314,6 +464,10 @@ where
     }
 
     let payload_len = u32::from_be_bytes(len_buf) as usize;
+    if payload_len > MAX_WIRE_PAYLOAD_BYTES {
+        return Err(anyhow!("wire payload exceeded {MAX_WIRE_PAYLOAD_BYTES} bytes"));
+    }
+
     let mut payload = vec![0u8; payload_len];
     stream
         .read_exact(&mut payload)
@@ -359,7 +513,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::io::duplex;
 
-    use super::{normalize_onion, read_wire_message, write_wire_message, WireMessage};
+    use super::{normalize_onion, read_wire_message, write_wire_message, WireMessage, WirePayload};
 
     #[test]
     fn normalizes_onion_addresses() {
@@ -372,13 +526,13 @@ mod tests {
     async fn wire_messages_round_trip() -> anyhow::Result<()> {
         let message = WireMessage {
             from: "alice.onion".to_owned(),
-            body: "hello".to_owned(),
+            payload: WirePayload::Text("hello".to_owned()),
         };
         let (mut writer, mut reader) = duplex(256);
 
         let expected = WireMessage {
             from: message.from.clone(),
-            body: message.body.clone(),
+            payload: WirePayload::Text("hello".to_owned()),
         };
         let writer_task = tokio::spawn(async move {
             write_wire_message(&mut writer, &expected).await?;
