@@ -91,7 +91,7 @@ target/x86_64-pc-windows-gnu/release/antifa.exe
 4. Share that `.onion` address with the person you want to talk to.
 5. Paste their `.onion` into `Friend .onion`.
 6. Optionally set a label in the `Label` field.
-7. Click `Start Session`.
+7. Click `Connect`.
 8. Type a message and press `Send` or `Enter`.
 
 ## Experimental video over Tor
@@ -106,7 +106,7 @@ Important limits:
 
 How to use it:
 
-1. Start a normal text session first or at least fill in the peer's `.onion`.
+1. Start a normal text connection first or at least fill in the peer's `.onion`.
 2. Click `Start Video`.
 3. Wait for the remote preview to start updating.
 4. If both sides want video, both sides should start video.

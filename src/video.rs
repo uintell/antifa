@@ -11,6 +11,8 @@ const DEFAULT_LINUX_DEVICE: &str = "/dev/video0";
 const DEFAULT_FRAME_RATE: &str = "2";
 #[cfg(target_os = "linux")]
 const DEFAULT_FRAME_SIZE: &str = "320x240";
+#[cfg(target_os = "linux")]
+const DEFAULT_X11GRAB_SIZE: &str = "1024x576";
 
 pub fn spawn_capture_process() -> anyhow::Result<Child> {
     let mut command = Command::new("ffmpeg");
@@ -37,7 +39,38 @@ pub fn spawn_capture_process() -> anyhow::Result<Child> {
 
 #[cfg(target_os = "linux")]
 fn apply_capture_input(command: &mut Command) -> anyhow::Result<()> {
-    let device = std::env::var("ANTIFA_VIDEO_DEVICE").unwrap_or_else(|_| DEFAULT_LINUX_DEVICE.into());
+    if let Ok(device) = std::env::var("ANTIFA_VIDEO_DEVICE") {
+        return apply_linux_v4l2_capture(command, &device);
+    }
+
+    if std::path::Path::new(DEFAULT_LINUX_DEVICE).exists() {
+        return apply_linux_v4l2_capture(command, DEFAULT_LINUX_DEVICE);
+    }
+
+    let display = std::env::var("DISPLAY")
+        .map_err(|_| anyhow!("no /dev/video0 found and DISPLAY is not set for X11 fallback"))?;
+    let display_input = if display.contains('.') || display.contains('+') {
+        display
+    } else {
+        format!("{display}.0")
+    };
+    let size =
+        std::env::var("ANTIFA_X11GRAB_SIZE").unwrap_or_else(|_| DEFAULT_X11GRAB_SIZE.into());
+    command.args([
+        "-f",
+        "x11grab",
+        "-framerate",
+        DEFAULT_FRAME_RATE,
+        "-video_size",
+    ]);
+    command.arg(size);
+    command.args(["-draw_mouse", "1", "-i"]);
+    command.arg(display_input);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_v4l2_capture(command: &mut Command, device: &str) -> anyhow::Result<()> {
     command.args([
         "-f",
         "v4l2",

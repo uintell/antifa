@@ -8,6 +8,8 @@ use crate::messaging::{ChatMessage, Peer};
 use crate::p2p;
 use crate::tor::TorEvent;
 
+const DEFAULT_FRIEND_ALIAS: &str = "Direct Contact";
+
 #[derive(Clone, Debug)]
 pub enum ConnectionState {
     Disconnected,
@@ -64,10 +66,10 @@ impl MessengerApp {
             video_active: false,
             video_status: "Video idle".to_owned(),
             friend_address: String::new(),
-            friend_alias: "Direct Session".to_owned(),
+            friend_alias: DEFAULT_FRIEND_ALIAS.to_owned(),
             message_input: String::new(),
             chat: Conversation {
-                peer_label: "Direct Session".into(),
+                peer_label: DEFAULT_FRIEND_ALIAS.into(),
                 onion: String::new(),
                 messages: vec![ChatMessage::system(
                     "Welcome. Wait for Tor to publish your .onion, then share it with a contact.",
@@ -116,7 +118,7 @@ impl MessengerApp {
                         self.friend_address = from.clone();
                     }
                     self.chat.onion = from.clone();
-                    if self.friend_alias == "Direct Session" {
+                    if self.friend_alias == DEFAULT_FRIEND_ALIAS {
                         self.friend_alias = from.clone();
                     }
                     self.chat.peer_label = self.friend_alias.clone();
@@ -248,7 +250,7 @@ impl eframe::App for MessengerApp {
             .frame(egui::Frame::none().fill(Color32::from_rgb(16, 18, 23)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading(RichText::new("Session-style Tor Messenger").color(Color32::WHITE));
+                    ui.heading(RichText::new("Antifa Messenger").color(Color32::WHITE));
                     ui.add_space(12.0);
                     ui.label(chip(
                         "Tor",
@@ -256,7 +258,7 @@ impl eframe::App for MessengerApp {
                         Color32::from_rgb(80, 180, 255),
                     ));
                     ui.label(chip(
-                        "Session",
+                        "Connection",
                         &self.connection_label(),
                         Color32::from_rgb(120, 230, 180),
                     ));
@@ -294,7 +296,7 @@ impl eframe::App for MessengerApp {
                     let connect_clicked = ui
                         .add_sized(
                             Vec2::new(ui.available_width(), 32.0),
-                            egui::Button::new("Start Session"),
+                            egui::Button::new("Connect"),
                         )
                         .clicked();
 
